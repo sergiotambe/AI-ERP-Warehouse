@@ -1,5 +1,3 @@
-Copia e incolla tutto quello che c'è qui sotto (dalla prima riga `# 🏢 Gestionale AI & Magazzino Universale` fino all'ultima riga in fondo) dentro il tuo file **`README.md`**:
-
 # 🏢 Gestionale AI & Magazzino Universale
 
 Applicazione desktop per la gestione intelligente di **Magazzino, Documenti Contabili (DDT, Fatture, Note di Credito) e Anagrafica Clienti/Fornitori**, dotata di un assistente AI integrato (basato su **Claude Haiku 5.5**) capace di operare in linguaggio naturale e leggere documenti PDF o immagini ricevuti dai fornitori.
