@@ -1,0 +1,9 @@
+customtkinter
+pillow
+pandas
+openpyxl
+fpdf2
+langchain-anthropic
+langchain-core
+langgraph
+pyinstaller
