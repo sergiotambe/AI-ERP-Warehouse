@@ -1,9 +1,12 @@
 import os
+import re
 import sys
 import json
 import shutil
 import sqlite3
 import datetime
+import unicodedata
+from difflib import SequenceMatcher
 import pandas as pd
 from fpdf import FPDF
 from langchain_core.tools import tool
@@ -134,6 +137,127 @@ def ripristina_backup_db(percorso_sorgente: str):
 
 
 esegui_backup_automatico(forza=False)
+
+
+# ==============================================================================
+# RICERCA INTELLIGENTE (FUZZY) DI ARTICOLI E SOGGETTI
+# ==============================================================================
+def _norm(s) -> str:
+    """Normalizza un testo: minuscolo, senza accenti, spazi e punteggiatura.
+    'Acro bat Bianco 14 Litri' e 'ACROBAT bianco 14litri' diventano identici."""
+    s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def _numeri(s: str) -> list:
+    return re.findall(r"\d+", s)
+
+
+def _cerca_fuzzy(testo: str, righe: list, campi: list, soglia: float = 0.72, max_risultati: int = 5):
+    """
+    Cerca `testo` tra le `righe` (lista di dict) confrontando i `campi`.
+    Restituisce (stato, elemento, candidati):
+      - ("trovato", dict, [])      -> corrispondenza certa (esatta o molto netta)
+      - ("incerto", None, [(score, dict), ...]) -> piu' candidati o solo simili: serve chiedere all'utente
+      - ("nessuno", None, [])      -> nessuna corrispondenza ragionevole
+    """
+    t = _norm(testo)
+    if not t:
+        return "nessuno", None, []
+
+    esatti = []
+    punteggi = []
+    for d in righe:
+        best = 0.0
+        esatto = False
+        for c in campi:
+            v = _norm(d.get(c, ""))
+            if not v:
+                continue
+            if v == t:
+                esatto = True
+                best = 1.0
+                break
+            if (len(t) >= 5 and t in v) or (len(v) >= 5 and v in t):
+                s = 0.9
+            else:
+                sm = SequenceMatcher(None, t, v)
+                if sm.real_quick_ratio() < soglia or sm.quick_ratio() < soglia:
+                    s = 0.0
+                else:
+                    s = sm.ratio()
+            # Se i numeri sono diversi (es. 14 litri vs 5 litri) NON e' mai una corrispondenza certa
+            if s < 1.0 and _numeri(t) != _numeri(v):
+                s = min(s, 0.85)
+            best = max(best, s)
+        if esatto:
+            esatti.append(d)
+        if best >= soglia:
+            punteggi.append((best, d))
+
+    if len(esatti) == 1:
+        return "trovato", esatti[0], []
+    if len(esatti) > 1:
+        return "incerto", None, [(1.0, d) for d in esatti[:max_risultati]]
+    if not punteggi:
+        return "nessuno", None, []
+
+    punteggi.sort(key=lambda x: -x[0])
+    top = punteggi[0][0]
+    secondo = punteggi[1][0] if len(punteggi) > 1 else 0.0
+    if top >= 0.9 and (top - secondo) >= 0.08:
+        return "trovato", punteggi[0][1], []
+    return "incerto", None, punteggi[:max_risultati]
+
+
+def _carica_articoli(cur) -> list:
+    cur.execute("SELECT * FROM magazzino")
+    return [dict(r) for r in cur.fetchall()]
+
+
+def _carica_soggetti(cur) -> list:
+    cur.execute("SELECT * FROM soggetti")
+    return [dict(r) for r in cur.fetchall()]
+
+
+def _risolvi_articolo(cur, chiave: str, cache: list = None):
+    righe = cache if cache is not None else _carica_articoli(cur)
+    return _cerca_fuzzy(chiave, righe, ["Codice", "Descrizione"])
+
+
+def _risolvi_soggetto(cur, nome: str, cache: list = None):
+    righe = cache if cache is not None else _carica_soggetti(cur)
+    return _cerca_fuzzy(nome, righe, ["Nome"])
+
+
+def _msg_candidati_articoli(chiave: str, cands: list) -> str:
+    elenco = "\n".join(
+        f"- [{d['Codice']}] {d['Descrizione']} (giacenza {d['Giacenza']}, somiglianza {s:.0%})"
+        for s, d in cands
+    )
+    return (
+        f"Nessuna corrispondenza CERTA per l'articolo '{chiave}'. Articoli simili trovati:\n{elenco}\n"
+        f"NON procedere: chiedi all'utente quale di questi intende, oppure se vuole creare un NUOVO articolo."
+    )
+
+
+def _msg_candidati_soggetti(nome: str, cands: list) -> str:
+    elenco = "\n".join(f"- {d['Nome']} ({d['Ruolo']}, somiglianza {s:.0%})" for s, d in cands)
+    return (
+        f"Nessuna corrispondenza CERTA per il soggetto '{nome}'. Soggetti simili in anagrafica:\n{elenco}\n"
+        f"NON procedere: chiedi all'utente quale intende, oppure se si tratta di un NUOVO soggetto."
+    )
+
+
+def _genera_codice_libero(cur, prefisso: str = "ART-") -> str:
+    cur.execute("SELECT COUNT(*) FROM magazzino")
+    n = cur.fetchone()[0] + 1
+    while True:
+        cod = f"{prefisso}{n:04d}"
+        cur.execute("SELECT 1 FROM magazzino WHERE LOWER(Codice) = LOWER(?)", (cod,))
+        if not cur.fetchone():
+            return cod
+        n += 1
 
 
 # ==============================================================================
@@ -466,22 +590,20 @@ def verifica_o_registra_soggetto(
     indirizzo: str = "",
     citta: str = "",
     email_pec: str = "",
-    telefono: str = ""
+    telefono: str = "",
+    conferma_nuovo: bool = False
 ) -> str:
     """
-    Controlla se un Cliente o Fornitore esiste già in anagrafica.
+    Controlla se un Cliente o Fornitore esiste già in anagrafica (la ricerca tollera refusi, spazi e maiuscole).
     Se non esiste, lo registra automaticamente con i dati disponibili.
+    Se esistono soggetti SIMILI ma non identici, NON registra nulla e restituisce l'elenco: chiedi all'utente
+    quale intende; solo se conferma che è un soggetto nuovo, richiama il tool con conferma_nuovo=True.
     """
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("SELECT * FROM soggetti WHERE LOWER(Nome) = LOWER(?)", (nome.strip(),))
-    row = cur.fetchone()
-    if not row:
-        cur.execute("SELECT * FROM soggetti WHERE LOWER(Nome) LIKE LOWER(?)", (f"%{nome.strip()}%",))
-        row = cur.fetchone()
+    stato, d, cands = _risolvi_soggetto(cur, nome)
 
-    if row:
-        d = dict(row)
+    if stato == "trovato":
         conn.close()
         return (
             f"Soggetto trovato in anagrafica: '{d['Nome']}' | Ruolo: {d['Ruolo']} | "
@@ -490,12 +612,20 @@ def verifica_o_registra_soggetto(
             f"PEC/Email: {d.get('Email_PEC') or 'N/D'} | Tel: {d.get('Telefono') or 'N/D'}"
         )
 
+    if stato == "incerto" and not conferma_nuovo:
+        conn.close()
+        return _msg_candidati_soggetti(nome, cands)
+
     ruolo_norm = "Fornitore" if "forn" in ruolo.lower() else "Cliente"
-    cur.execute("""
-        INSERT INTO soggetti (Nome, Ruolo, Partita_IVA, Codice_Fiscale, Indirizzo, Citta, Email_PEC, Telefono)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (nome.strip(), ruolo_norm, partita_iva, codice_fiscale, indirizzo, citta, email_pec, telefono))
-    conn.commit()
+    try:
+        cur.execute("""
+            INSERT INTO soggetti (Nome, Ruolo, Partita_IVA, Codice_Fiscale, Indirizzo, Citta, Email_PEC, Telefono)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (nome.strip(), ruolo_norm, partita_iva, codice_fiscale, indirizzo, citta, email_pec, telefono))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return f"Errore: esiste già un soggetto con nome '{nome.strip()}'."
     conn.close()
     return f"Nuovo {ruolo_norm} '{nome.strip()}' registrato in anagrafica."
 
@@ -521,21 +651,14 @@ def modifica_o_elimina_soggetto(
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM soggetti WHERE LOWER(Nome) = LOWER(?)", (nome_attuale.strip(),))
-    row = cur.fetchone()
-    if not row:
-        cur.execute("SELECT * FROM soggetti WHERE LOWER(Nome) LIKE LOWER(?)", (f"%{nome_attuale.strip()}%",))
-        trovati = cur.fetchall()
-        if len(trovati) == 0:
-            conn.close()
-            return f"Nessun cliente o fornitore trovato con nome '{nome_attuale}'."
-        elif len(trovati) > 1:
-            nomi = ", ".join([r["Nome"] for r in trovati])
-            conn.close()
-            return f"Trovati più soggetti corrispondenti a '{nome_attuale}': {nomi}. Specifica il nome esatto."
-        row = trovati[0]
+    stato, soggetto, cands = _risolvi_soggetto(cur, nome_attuale)
+    if stato == "nessuno":
+        conn.close()
+        return f"Nessun cliente o fornitore trovato con nome '{nome_attuale}'."
+    if stato == "incerto":
+        conn.close()
+        return _msg_candidati_soggetti(nome_attuale, cands)
 
-    soggetto = dict(row)
     nome_vecchio = soggetto["Nome"]
 
     if elimina_soggetto:
@@ -589,27 +712,47 @@ def modifica_o_elimina_soggetto(
 def cerca_articolo_magazzino(termine_ricerca: str) -> str:
     """
     Cerca articoli nel magazzino per Codice, Descrizione oppure valori contenuti negli attributi extra (es. Reparto, Deposito, Ubicazione, Fornitore).
+    La ricerca tollera refusi, spazi diversi e parole in ordine sparso.
     """
     conn = get_conn()
     cur = conn.cursor()
-    q = f"%{termine_ricerca.strip()}%"
-    cur.execute("""
+
+    parole = [p.lower() for p in termine_ricerca.strip().split() if p.strip()]
+    if not parole:
+        conn.close()
+        return "Specifica un termine di ricerca."
+
+    cond = "(LOWER(Codice) LIKE ? OR LOWER(Descrizione) LIKE ? OR LOWER(Extra_JSON) LIKE ?)"
+    where = " AND ".join([cond] * len(parole))
+    params = []
+    for p in parole:
+        params.extend([f"%{p}%"] * 3)
+
+    cur.execute(f"""
         SELECT Codice, Descrizione, Giacenza, Prezzo_Acq_Medio, Prezzo_Listino, Extra_JSON
         FROM magazzino
-        WHERE LOWER(Codice) LIKE LOWER(?)
-           OR LOWER(Descrizione) LIKE LOWER(?)
-           OR LOWER(Extra_JSON) LIKE LOWER(?)
+        WHERE {where}
         LIMIT 25
-    """, (q, q, q))
-    righe = cur.fetchall()
+    """, params)
+    righe = [dict(r) for r in cur.fetchall()]
+    intestazione = ""
+
+    if not righe:
+        # Fallback fuzzy: tollera refusi e spazi (es. "acro bat bianco 14 litri")
+        tutti = _carica_articoli(cur)
+        stato, art, cands = _cerca_fuzzy(termine_ricerca, tutti, ["Codice", "Descrizione"])
+        if stato == "trovato":
+            righe = [art]
+        elif stato == "incerto":
+            righe = [d for _, d in cands]
+            intestazione = f"Nessuna corrispondenza esatta per '{termine_ricerca}'. Articoli simili:\n"
     conn.close()
 
     if not righe:
         return f"Nessun articolo trovato in magazzino per '{termine_ricerca}'."
 
     risultati = []
-    for r in righe:
-        d = dict(r)
+    for d in righe:
         extra_str = ""
         try:
             ex = json.loads(d.get("Extra_JSON") or "{}")
@@ -619,9 +762,10 @@ def cerca_articolo_magazzino(termine_ricerca: str) -> str:
             pass
         risultati.append(
             f"- [{d['Codice']}] {d['Descrizione']} | Giacenza: {d['Giacenza']} | "
-            f"P.Acq.Medio: {d['Prezzo_Acq_Medio']:.2f} EUR | Listino(IVATO): {d['Prezzo_Listino']:.2f} EUR{extra_str}"
+            f"P.Acq.Medio: {float(d['Prezzo_Acq_Medio'] or 0):.2f} EUR | "
+            f"Listino(IVATO): {float(d['Prezzo_Listino'] or 0):.2f} EUR{extra_str}"
         )
-    return "\n".join(risultati)
+    return intestazione + "\n".join(risultati)
 
 
 @tool
@@ -637,27 +781,31 @@ def modifica_articolo_magazzino(
     """
     conn = get_conn()
     cur = conn.cursor()
-    q = f"%{codice_o_descrizione.strip()}%"
-    cur.execute("SELECT * FROM magazzino WHERE LOWER(Codice) = LOWER(?) OR LOWER(Descrizione) LIKE LOWER(?)", (codice_o_descrizione.strip(), q))
-    row = cur.fetchone()
-    if not row:
+    stato, d, cands = _risolvi_articolo(cur, codice_o_descrizione)
+    if stato == "nessuno":
         conn.close()
         return f"Articolo '{codice_o_descrizione}' non trovato in magazzino."
+    if stato == "incerto":
+        conn.close()
+        return _msg_candidati_articoli(codice_o_descrizione, cands)
 
-    d = dict(row)
     cod_fin = nuovo_codice.strip() if nuovo_codice.strip() else d["Codice"]
     desc_fin = nuova_descrizione.strip() if nuova_descrizione.strip() else d["Descrizione"]
     acq_fin = round(nuovo_prezzo_acquisto, 2) if nuovo_prezzo_acquisto >= 0 else d["Prezzo_Acq_Medio"]
     list_fin = round(nuovo_prezzo_listino, 2) if nuovo_prezzo_listino >= 0 else d["Prezzo_Listino"]
 
-    cur.execute("""
-        UPDATE magazzino
-        SET Codice = ?, Descrizione = ?, Prezzo_Acq_Medio = ?, Prezzo_Listino = ?
-        WHERE id = ?
-    """, (cod_fin, desc_fin, acq_fin, list_fin, d["id"]))
-    conn.commit()
+    try:
+        cur.execute("""
+            UPDATE magazzino
+            SET Codice = ?, Descrizione = ?, Prezzo_Acq_Medio = ?, Prezzo_Listino = ?
+            WHERE id = ?
+        """, (cod_fin, desc_fin, acq_fin, list_fin, d["id"]))
+        conn.commit()
+    except sqlite3.IntegrityError:
+        conn.close()
+        return f"Errore: esiste già un articolo con codice '{cod_fin}'."
     conn.close()
-    return f"Articolo aggiornato: [{cod_fin}] {desc_fin} | P.Acq: {acq_fin:.2f} EUR | Listino: {list_fin:.2f} EUR"
+    return f"Articolo aggiornato: [{cod_fin}] {desc_fin} | P.Acq: {float(acq_fin or 0):.2f} EUR | Listino: {float(list_fin or 0):.2f} EUR"
 
 
 @tool
@@ -674,14 +822,14 @@ def aggiorna_attributi_extra_articolo(codice_o_descrizione: str, attributi_json:
 
     conn = get_conn()
     cur = conn.cursor()
-    q = f"%{codice_o_descrizione.strip()}%"
-    cur.execute("SELECT * FROM magazzino WHERE LOWER(Codice) = LOWER(?) OR LOWER(Descrizione) LIKE LOWER(?)", (codice_o_descrizione.strip(), q))
-    row = cur.fetchone()
-    if not row:
+    stato, d, cands = _risolvi_articolo(cur, codice_o_descrizione)
+    if stato == "nessuno":
         conn.close()
         return f"Articolo '{codice_o_descrizione}' non trovato in magazzino."
+    if stato == "incerto":
+        conn.close()
+        return _msg_candidati_articoli(codice_o_descrizione, cands)
 
-    d = dict(row)
     try:
         extra_attuale = json.loads(d.get("Extra_JSON") or "{}")
     except Exception:
@@ -706,24 +854,32 @@ def aggiorna_giacenza(
     descrizione_nuovo_articolo: str = "",
     prezzo_acquisto: float = 0.0,
     prezzo_listino: float = 0.0,
-    attributi_extra_json: str = "{}"
+    attributi_extra_json: str = "{}",
+    conferma_nuovo_articolo: bool = False
 ) -> str:
     """
-    Aggiunge (+N) o sottrae (-N) quantità in magazzino. Se l'articolo non esiste e variazione_quantita > 0, lo crea automaticamente.
+    Aggiunge (+N) o sottrae (-N) quantità in magazzino. La ricerca dell'articolo tollera refusi, spazi e maiuscole
+    (es. 'acro bat bianco 14 litri' trova 'acrobat bianco 14litri').
+    Se l'articolo NON esiste e non ci sono articoli simili, con variazione_quantita > 0 lo crea automaticamente.
+    Se esistono articoli SIMILI ma non identici, NON modifica e NON crea nulla: restituisce l'elenco dei candidati.
+    In quel caso chiedi all'utente quale intende; solo se conferma esplicitamente che è un articolo NUOVO,
+    richiama il tool con conferma_nuovo_articolo=True.
     """
     conn = get_conn()
     cur = conn.cursor()
-    q = f"%{codice_o_descrizione.strip()}%"
-    cur.execute("SELECT * FROM magazzino WHERE LOWER(Codice) = LOWER(?) OR LOWER(Descrizione) LIKE LOWER(?)", (codice_o_descrizione.strip(), q))
-    row = cur.fetchone()
+
+    stato, d, cands = _risolvi_articolo(cur, codice_o_descrizione)
+
+    if stato == "incerto" and not conferma_nuovo_articolo:
+        conn.close()
+        return _msg_candidati_articoli(codice_o_descrizione, cands)
 
     try:
         extra_in = json.loads(attributi_extra_json) if attributi_extra_json else {}
     except Exception:
         extra_in = {}
 
-    if row:
-        d = dict(row)
+    if stato == "trovato":
         giac_vecchia = int(d["Giacenza"] or 0)
         giac_nuova = giac_vecchia + int(variazione_quantita)
 
@@ -753,22 +909,36 @@ def aggiorna_giacenza(
         """, (giac_nuova, acq_nuovo, list_nuovo, json.dumps(ex_old, ensure_ascii=False), d["id"]))
         conn.commit()
         conn.close()
-        return f"Giacenza aggiornata per [{d['Codice']}] {d['Descrizione']}: ora {giac_nuova} pz (P.Acq.Medio: {acq_nuovo:.2f} EUR, Listino: {list_nuovo:.2f} EUR)."
-    else:
-        cur.execute("SELECT COUNT(*) FROM magazzino")
-        n_art = cur.fetchone()[0] + 1
-        cod_nuovo = codice_o_descrizione.strip().upper() if len(codice_o_descrizione.strip()) <= 15 and " " not in codice_o_descrizione.strip() else f"ART-{n_art:04d}"
-        desc_nuova = descrizione_nuovo_articolo.strip() if descrizione_nuovo_articolo.strip() else codice_o_descrizione.strip()
-        acq_nuovo = round(prezzo_acquisto, 2) if prezzo_acquisto > 0 else 0.0
-        list_nuovo = round(prezzo_listino, 2) if prezzo_listino > 0 else (round(acq_nuovo * 1.22 * 1.30, 2) if acq_nuovo > 0 else 0.0)
+        return f"Giacenza aggiornata per [{d['Codice']}] {d['Descrizione']}: da {giac_vecchia} a {giac_nuova} pz (P.Acq.Medio: {acq_nuovo:.2f} EUR, Listino: {list_nuovo:.2f} EUR)."
 
-        cur.execute("""
-            INSERT INTO magazzino (Codice, Descrizione, Giacenza, Prezzo_Acq_Medio, Prezzo_Listino, Extra_JSON)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (cod_nuovo, desc_nuova, int(variazione_quantita), acq_nuovo, list_nuovo, json.dumps(extra_in, ensure_ascii=False)))
-        conn.commit()
+    # --- Articolo non esistente (o creazione esplicitamente confermata) ---
+    if variazione_quantita < 0 and not conferma_nuovo_articolo:
         conn.close()
-        return f"Nuovo articolo inserito in magazzino: [{cod_nuovo}] {desc_nuova} | Giacenza: {variazione_quantita} pz | Listino: {list_nuovo:.2f} EUR."
+        return (
+            f"Articolo '{codice_o_descrizione}' non trovato in magazzino: non posso scaricare {abs(variazione_quantita)} pz "
+            f"da un articolo inesistente. Chiedi all'utente di verificare il nome."
+        )
+
+    chiave = codice_o_descrizione.strip()
+    if len(chiave) <= 15 and " " not in chiave:
+        cod_nuovo = chiave.upper()
+        cur.execute("SELECT 1 FROM magazzino WHERE LOWER(Codice) = LOWER(?)", (cod_nuovo,))
+        if cur.fetchone():
+            cod_nuovo = _genera_codice_libero(cur)
+    else:
+        cod_nuovo = _genera_codice_libero(cur)
+
+    desc_nuova = descrizione_nuovo_articolo.strip() if descrizione_nuovo_articolo.strip() else chiave
+    acq_nuovo = round(prezzo_acquisto, 2) if prezzo_acquisto > 0 else 0.0
+    list_nuovo = round(prezzo_listino, 2) if prezzo_listino > 0 else (round(acq_nuovo * 1.22 * 1.30, 2) if acq_nuovo > 0 else 0.0)
+
+    cur.execute("""
+        INSERT INTO magazzino (Codice, Descrizione, Giacenza, Prezzo_Acq_Medio, Prezzo_Listino, Extra_JSON)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (cod_nuovo, desc_nuova, int(variazione_quantita), acq_nuovo, list_nuovo, json.dumps(extra_in, ensure_ascii=False)))
+    conn.commit()
+    conn.close()
+    return f"Nuovo articolo inserito in magazzino: [{cod_nuovo}] {desc_nuova} | Giacenza: {variazione_quantita} pz | Listino: {list_nuovo:.2f} EUR."
 
 
 @tool
@@ -784,6 +954,7 @@ def emetti_documento(
     """
     Emette un documento di vendita verso un Cliente ('DDT', 'FATTURA' o 'NOTA_CREDITO'), genera il PDF formale in Documenti_PDF/ e aggiorna le giacenze di magazzino.
     `righe_json` deve essere una lista JSON di oggetti con chiavi: 'descrizione' (o 'codice'), 'quantita', 'prezzo_unitario' (opzionale: se 0 usa il listino di magazzino), 'iva' (default 22).
+    Se un articolo o il cliente sono ambigui/simili a più voci esistenti, il tool NON emette nulla e restituisce i candidati: chiedi all'utente quale intende.
     """
     tipo = tipo_documento.strip().upper().replace(" ", "_")
     if tipo not in ("DDT", "FATTURA", "NOTA_CREDITO"):
@@ -797,11 +968,28 @@ def emetti_documento(
     conn = get_conn()
     cur = conn.cursor()
 
-    # Recupera o registra soggetto
-    cur.execute("SELECT * FROM soggetti WHERE LOWER(Nome) LIKE LOWER(?)", (f"%{cliente.strip()}%",))
-    row_sog = cur.fetchone()
-    if row_sog:
-        soggetto_dict = dict(row_sog)
+    # --- FASE 1: verifica di soggetto e articoli PRIMA di scrivere qualsiasi cosa ---
+    stato_s, sog_db, cands_s = _risolvi_soggetto(cur, cliente)
+    if stato_s == "incerto":
+        conn.close()
+        return _msg_candidati_soggetti(cliente, cands_s)
+
+    articoli_cache = _carica_articoli(cur)
+    risolti = []
+    problemi = []
+    for r in righe_input:
+        chiave_art = str(r.get("codice") or r.get("descrizione") or "").strip()
+        stato_a, art_db, cands_a = _risolvi_articolo(cur, chiave_art, cache=articoli_cache)
+        if stato_a == "incerto":
+            problemi.append(_msg_candidati_articoli(chiave_art, cands_a))
+        risolti.append((r, chiave_art, art_db))
+    if problemi:
+        conn.close()
+        return "\n\n".join(problemi)
+
+    # --- FASE 2: registrazione ---
+    if stato_s == "trovato":
+        soggetto_dict = sog_db
     else:
         cur.execute("INSERT INTO soggetti (Nome, Ruolo) VALUES (?, 'Cliente')", (cliente.strip(),))
         soggetto_dict = {"Nome": cliente.strip(), "Ruolo": "Cliente"}
@@ -818,17 +1006,12 @@ def emetti_documento(
 
     segno_mag = 1 if tipo == "NOTA_CREDITO" else -1
 
-    for r in righe_input:
-        chiave_art = str(r.get("codice") or r.get("descrizione") or "").strip()
+    for r, chiave_art, art_d in risolti:
         qta = int(r.get("quantita", 1))
         iva_perc = int(r.get("iva", 22))
         prezzo_in = float(r.get("prezzo_unitario", 0.0))
 
-        cur.execute("SELECT * FROM magazzino WHERE LOWER(Codice) = LOWER(?) OR LOWER(Descrizione) LIKE LOWER(?)", (chiave_art, f"%{chiave_art}%"))
-        art_db = cur.fetchone()
-
-        if art_db:
-            art_d = dict(art_db)
+        if art_d:
             codice_art = art_d["Codice"]
             desc_art = r.get("descrizione") or art_d["Descrizione"]
             if prezzo_in <= 0:
@@ -838,8 +1021,7 @@ def emetti_documento(
                 ivato = prezzi_ivato_inclusa
 
             if scarica_magazzino:
-                nuova_giac = int(art_d["Giacenza"] or 0) + (segno_mag * qta)
-                cur.execute("UPDATE magazzino SET Giacenza = ? WHERE id = ?", (nuova_giac, art_d["id"]))
+                cur.execute("UPDATE magazzino SET Giacenza = COALESCE(Giacenza, 0) + ? WHERE id = ?", (segno_mag * qta, art_d["id"]))
         else:
             codice_art = "-"
             desc_art = chiave_art
@@ -918,6 +1100,7 @@ def registra_documento_fornitore(
 ) -> str:
     """
     Registra un documento ricevuto da un Fornitore ('FATTURA', 'DDT' o 'NOTA_CREDITO'), archivia una copia del file in Documenti_PDF/ e carica le quantità acquistate in magazzino.
+    Se il fornitore o un articolo risultano ambigui/simili a più voci esistenti, il tool NON registra nulla e restituisce i candidati: chiedi all'utente quale intende.
     """
     tipo = tipo_documento.strip().upper().replace(" ", "_")
     if "FATT" in tipo:
@@ -935,11 +1118,41 @@ def registra_documento_fornitore(
     conn = get_conn()
     cur = conn.cursor()
 
-    cur.execute("SELECT * FROM soggetti WHERE LOWER(Nome) LIKE LOWER(?)", (f"%{fornitore.strip()}%",))
-    row_forn = cur.fetchone()
-    if row_forn:
+    # --- FASE 1: verifiche preliminari (nessuna scrittura) ---
+    stato_f, row_forn, cands_f = _risolvi_soggetto(cur, fornitore)
+    if stato_f == "incerto":
+        conn.close()
+        return _msg_candidati_soggetti(fornitore, cands_f)
+
+    articoli_cache = _carica_articoli(cur)
+    risolti = []
+    problemi = []
+    for r in righe_input:
+        cod = str(r.get("codice") or "").strip()
+        desc = str(r.get("descrizione") or "").strip()
+        art = None
+        stato_a = "nessuno"
+        cands_a = []
+        if aggiorna_anche_magazzino and (cod or desc):
+            if cod:
+                stato_a, art, cands_a = _cerca_fuzzy(cod, articoli_cache, ["Codice"])
+                if stato_a == "incerto":
+                    # il codice fornitore non corrisponde con certezza: prova con la descrizione
+                    stato_a, art, cands_a = ("nessuno", None, [])
+            if not art and desc:
+                stato_a, art, cands_a = _risolvi_articolo(cur, desc, cache=articoli_cache)
+            if stato_a == "incerto":
+                problemi.append(_msg_candidati_articoli(desc or cod, cands_a))
+        risolti.append((r, cod, desc, art))
+    if problemi:
+        conn.close()
+        return "\n\n".join(problemi)
+
+    # --- FASE 2: registrazione ---
+    if stato_f == "trovato":
+        row_forn = row_forn
         nome_forn_ufficiale = row_forn["Nome"]
-        if partita_iva_fornitore and not row_forn["Partita_IVA"]:
+        if partita_iva_fornitore and not row_forn.get("Partita_IVA"):
             cur.execute("UPDATE soggetti SET Partita_IVA = ? WHERE id = ?", (partita_iva_fornitore, row_forn["id"]))
     else:
         nome_forn_ufficiale = fornitore.strip()
@@ -952,9 +1165,7 @@ def registra_documento_fornitore(
     voci_riassunto = []
     righe_salvate = []
 
-    for r in righe_input:
-        cod = str(r.get("codice") or "").strip()
-        desc = str(r.get("descrizione") or "").strip()
+    for r, cod, desc, ad in risolti:
         qta = int(r.get("quantita", 1))
         p_netto = float(r.get("prezzo_unitario_netto", r.get("prezzo_unitario", 0.0)))
         sconto = float(r.get("sconto", 0.0))
@@ -964,38 +1175,39 @@ def registra_documento_fornitore(
 
         voci_riassunto.append(f"{qta}x {desc or cod}")
         righe_salvate.append({
-            "codice": cod,
-            "descrizione": desc,
+            "codice": ad["Codice"] if ad else cod,
+            "descrizione": desc or (ad["Descrizione"] if ad else cod),
             "quantita": qta,
             "prezzo_unitario_netto": round(p_netto, 2),
             "iva": iva_p
         })
 
         if aggiorna_anche_magazzino and (cod or desc):
-            cur.execute("SELECT * FROM magazzino WHERE (LOWER(Codice) = LOWER(?) AND ? != '') OR LOWER(Descrizione) LIKE LOWER(?)", (cod, cod, f"%{desc}%"))
-            art_db = cur.fetchone()
-            if art_db:
-                ad = dict(art_db)
-                g_old = int(ad["Giacenza"] or 0)
+            if ad:
+                cur.execute("SELECT Giacenza, Prezzo_Acq_Medio, Prezzo_Listino FROM magazzino WHERE id = ?", (ad["id"],))
+                cur_row = cur.fetchone()
+                g_old = int(cur_row["Giacenza"] or 0)
                 g_new = g_old + (segno_mag * qta)
-                acq_old = float(ad["Prezzo_Acq_Medio"] or 0.0)
+                acq_old = float(cur_row["Prezzo_Acq_Medio"] or 0.0)
+                list_old = float(cur_row["Prezzo_Listino"] or 0.0)
                 if segno_mag > 0 and p_netto > 0:
                     if g_old > 0 and acq_old > 0:
                         acq_new = round(((g_old * acq_old) + (qta * p_netto)) / (g_old + qta), 2)
                     else:
                         acq_new = round(p_netto, 2)
-                    list_new = round(p_netto * (1 + iva_p / 100.0) * 1.30, 2) if float(ad["Prezzo_Listino"] or 0) == 0 else ad["Prezzo_Listino"]
+                    list_new = round(p_netto * (1 + iva_p / 100.0) * 1.30, 2) if list_old == 0 else list_old
                 else:
                     acq_new = acq_old
-                    list_new = ad["Prezzo_Listino"]
+                    list_new = list_old
 
                 cur.execute("""
                     UPDATE magazzino SET Giacenza = ?, Prezzo_Acq_Medio = ?, Prezzo_Listino = ? WHERE id = ?
                 """, (g_new, acq_new, list_new, ad["id"]))
             elif segno_mag > 0:
-                cur.execute("SELECT COUNT(*) FROM magazzino")
-                n_a = cur.fetchone()[0] + 1
-                cod_gen = cod if cod else f"ART-{n_a:04d}"
+                cod_gen = cod if cod else _genera_codice_libero(cur)
+                cur.execute("SELECT 1 FROM magazzino WHERE LOWER(Codice) = LOWER(?)", (cod_gen,))
+                if cur.fetchone():
+                    cod_gen = _genera_codice_libero(cur)
                 list_calc = round(p_netto * (1 + iva_p / 100.0) * 1.30, 2) if p_netto > 0 else 0.0
                 cur.execute("""
                     INSERT INTO magazzino (Codice, Descrizione, Giacenza, Prezzo_Acq_Medio, Prezzo_Listino, Extra_JSON)
@@ -1038,21 +1250,28 @@ def emetti_fattura_differita(cliente: str) -> str:
     """
     conn = get_conn()
     cur = conn.cursor()
+
+    stato, sog, cands = _risolvi_soggetto(cur, cliente)
+    if stato == "incerto":
+        conn.close()
+        return _msg_candidati_soggetti(cliente, cands)
+    if stato == "nessuno":
+        conn.close()
+        return f"Nessun cliente trovato in anagrafica con nome '{cliente}'."
+
+    nome_cliente = sog["Nome"]
     cur.execute("""
         SELECT * FROM documenti
         WHERE UPPER(Tipo) = 'DDT' AND Ruolo = 'Cliente' AND UPPER(Fatturato) = 'NO'
-          AND LOWER(Cliente) LIKE LOWER(?)
-    """, (f"%{cliente.strip()}%",))
+          AND LOWER(Cliente) = LOWER(?)
+    """, (nome_cliente,))
     ddt_list = [dict(r) for r in cur.fetchall()]
 
     if not ddt_list:
         conn.close()
-        return f"Nessun DDT in sospeso da fatturare trovato per '{cliente}'."
+        return f"Nessun DDT in sospeso da fatturare trovato per '{nome_cliente}'."
 
-    nome_cliente = ddt_list[0]["Cliente"]
-    cur.execute("SELECT * FROM soggetti WHERE LOWER(Nome) = LOWER(?)", (nome_cliente,))
-    row_sog = cur.fetchone()
-    soggetto_dict = dict(row_sog) if row_sog else {"Nome": nome_cliente}
+    soggetto_dict = sog
 
     righe_unite = []
     numeri_ddt = []
@@ -1139,7 +1358,7 @@ def modifica_documento(
     cur.execute("UPDATE documenti SET Data = ?, Cliente = ?, Importo_Totale = ? WHERE id = ?", (data_f, sog_f, imp_f, doc["id"]))
     conn.commit()
     conn.close()
-    return f"Documento {doc['Tipo']} N. {numero} ({doc['Ruolo']}) aggiornato: Data={data_f}, Soggetto='{sog_f}', Totale={imp_f:.2f} EUR."
+    return f"Documento {doc['Tipo']} N. {numero} ({doc['Ruolo']}) aggiornato: Data={data_f}, Soggetto='{sog_f}', Totale={float(imp_f or 0):.2f} EUR."
 
 
 @tool
@@ -1169,6 +1388,7 @@ def elimina_documenti(
 
     doc = trovati[0]
     ripristinati = []
+    non_ripristinati = []
 
     if ripristina_magazzino:
         try:
@@ -1183,19 +1403,31 @@ def elimina_documenti(
         else:
             moltiplicatore = 1 if doc["Tipo"].upper() == "NOTA_CREDITO" else -1
 
+        articoli_cache = _carica_articoli(cur)
         for r in righe_det:
             cod = str(r.get("codice") or "").strip()
             desc = str(r.get("descrizione") or "").strip()
             qta = int(r.get("quantita", 0))
             if qta == 0:
                 continue
-            cur.execute("SELECT * FROM magazzino WHERE (LOWER(Codice) = LOWER(?) AND ? != '' AND ? != '-') OR LOWER(Descrizione) LIKE LOWER(?)", (cod, cod, cod, f"%{desc}%"))
-            art = cur.fetchone()
+
+            art = None
+            if cod and cod != "-":
+                stato, art, _ = _cerca_fuzzy(cod, articoli_cache, ["Codice"])
+                if stato != "trovato":
+                    art = None
+            if not art and desc:
+                stato, art, _ = _cerca_fuzzy(desc, articoli_cache, ["Codice", "Descrizione"])
+                if stato != "trovato":
+                    art = None
+
             if art:
-                ad = dict(art)
-                nuova_g = int(ad["Giacenza"] or 0) + (moltiplicatore * qta)
-                cur.execute("UPDATE magazzino SET Giacenza = ? WHERE id = ?", (nuova_g, ad["id"]))
-                ripristinati.append(f"{ad['Descrizione']} (nuova giacenza: {nuova_g})")
+                cur.execute("UPDATE magazzino SET Giacenza = COALESCE(Giacenza, 0) + ? WHERE id = ?", (moltiplicatore * qta, art["id"]))
+                cur.execute("SELECT Giacenza FROM magazzino WHERE id = ?", (art["id"],))
+                nuova_g = cur.fetchone()["Giacenza"]
+                ripristinati.append(f"{art['Descrizione']} (nuova giacenza: {nuova_g})")
+            else:
+                non_ripristinati.append(desc or cod)
 
     # Rimuove anche eventuale PDF/allegato associato
     nome_clean = doc["Cliente"].replace(" ", "_").replace(".", "").replace("'", "").replace("/", "_")
@@ -1213,6 +1445,8 @@ def elimina_documenti(
     conn.close()
 
     extra_msg = f" Giacenze ripristinate: {', '.join(ripristinati)}." if ripristinati else ""
+    if non_ripristinati:
+        extra_msg += f" ATTENZIONE: articoli non trovati in magazzino, giacenza NON ripristinata: {', '.join(non_ripristinati)}."
     return f"Eliminato {doc['Tipo']} N. {doc['Numero']} ({doc['Ruolo']} - {doc['Cliente']}).{extra_msg}"
 
 
