@@ -3,6 +3,7 @@ import re
 import sys
 import json
 import base64
+import unicodedata
 import threading
 import datetime
 import pandas as pd
@@ -70,6 +71,11 @@ SYSTEM_PROMPT = """Sei un assistente gestionale aziendale. Hai accesso diretto a
 11. apri_documento_pdf: apre un documento salvato quando l'utente lo chiede.
 
 REGOLE OPERATIVE RIGIDE:
+- RICONOSCIMENTO ARTICOLI E SOGGETTI (ANTI-DUPLICATI):
+  * I tool di scrittura cercano già in modo tollerante (refusi, spazi, maiuscole): passa il nome così come lo scrive l'utente, NON provare a "correggerlo" o a inventare codici.
+  * Se un tool risponde "Nessuna corrispondenza CERTA ... Articoli/Soggetti simili", NON creare nulla e NON scegliere tu: mostra all'utente l'elenco dei candidati e chiedi quale intende, oppure se è un articolo/soggetto NUOVO.
+  * Solo se l'utente conferma esplicitamente che è NUOVO, richiama il tool con `conferma_nuovo_articolo=True` (aggiorna_giacenza) oppure `conferma_nuovo=True` (verifica_o_registra_soggetto).
+  * Se l'utente sceglie uno dei candidati, richiama il tool usando il CODICE esatto di quel candidato.
 - GESTIONE ANAGRAFICA CLIENTI E FORNITORI:
   * Quando l'utente chiede di correggere il nome/ragione sociale di un cliente o fornitore (es. "correggi GiuseppeTambe spa in Giuseppe Tambè S.p.A.") o di aggiornare Partita IVA, Codice Fiscale, Indirizzo, Città, PEC o Telefono, usa subito `modifica_o_elimina_soggetto`.
 - ATTRIBUTI EXTRA DINAMICI E MULTI-MAGAZZINO:
@@ -95,7 +101,19 @@ REGOLE OPERATIVE RIGIDE:
   * Se l'utente chiede di eliminare o annullare un documento ("cancella questo documento", "fai finta che non sia mai esistito"), chiama `elimina_documenti` con `ripristina_magazzino=True` (NON modificare manualmente il magazzino a parte, perché `elimina_documenti` ripristina già in automatico giacenze, prezzi di acquisto medi, listini e anagrafica). Riporta poi chiaramente all'utente tutto ciò che è stato ripristinato.
 - OPACITÀ E ZERO LOG: Quando aggiorni il magazzino, sovrascrivi solo la giacenza senza log storici.
 
-Rispondi sempre in modo sintetico, diretto e professionale."""
+- ARTICOLI PRE-SELEZIONATI DAL MAGAZZINO (dal pulsante "Crea Documento da Magazzino"):
+  * Se il messaggio contiene un blocco "Articoli selezionati dal magazzino" con righe nel formato "- N x [CODICE] Descrizione" (eventualmente seguite da "@ prezzo EUR IVA inclusa/IVA esclusa"), quei CODICI sono già verificati ed ESATTI: usali direttamente come 'codice' in `righe_json`, senza cercarli di nuovo e senza chiedere conferma sull'identità degli articoli.
+  * Per ogni riga: se c'è "@ prezzo" usa quel `prezzo_unitario` (con `prezzi_ivato_inclusa=True` se "IVA inclusa", False se "IVA esclusa"); se non c'è ma l'utente indica un prezzo nel testo, applica quello; altrimenti lascia `prezzo_unitario` a 0 per usare il listino di magazzino.
+  * Se l'utente indica un Cliente usa `emetti_documento` (DDT, FATTURA o NOTA_CREDITO come richiesto). Se indica un Fornitore si tratta di un documento ricevuto: usa `registra_documento_fornitore` (i prezzi sono di acquisto netti), chiedendo prima numero documento, data e totale se mancano e mostrando un riepilogo da confermare.
+  * Se il tipo di documento o il destinatario non sono specificati, chiedili con UNA sola domanda.
+
+FORMATO DELLE RISPOSTE (OBBLIGATORIO):
+- Rispondi SEMPRE in italiano, direttamente, senza preamboli e senza mostrare ragionamenti, calcoli intermedi o nomi di strumenti.
+- Prima riga: l'esito in una frase breve (es. "Fatto: giacenza aggiornata.").
+- Se ci sono più dati (articoli, documenti, candidati, righe di un riepilogo), usa un ELENCO PUNTATO con il simbolo "- ", UNA riga per voce, nel formato "- [Codice] Descrizione: dato1, dato2".
+- Mai paragrafi lunghi: massimo 8 righe, salvo il riepilogo di un documento fornitore (elenco strutturato con Fornitore, Tipo, Numero, Data, righe, Totale).
+- NON usare markdown: niente **grassetto**, niente # titoli, niente tabelle con |. L'interfaccia mostra solo testo semplice.
+- Se serve una decisione dell'utente, termina con UNA sola domanda chiara."""
 
 
 def interpreta_data(testo_data: str):
@@ -127,6 +145,44 @@ def interpreta_data(testo_data: str):
 
     dt = pd.to_datetime(s, dayfirst=True, errors="coerce")
     return dt if pd.notna(dt) else "INVALID"
+
+
+def norm_ricerca(s) -> str:
+    """Minuscolo, senza accenti, spazi e punteggiatura (per ricerche tolleranti)."""
+    s = unicodedata.normalize("NFKD", str(s or "")).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def estrai_testo(content) -> str:
+    """Estrae SOLO il testo visibile da una risposta del modello.
+    Con content a blocchi la risposta e' una lista di dict (text, thinking, tool_use...):
+    qui teniamo solo i blocchi di tipo 'text', cosi' non compaiono strutture o ragionamenti."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        parti = []
+        for b in content:
+            if isinstance(b, str):
+                parti.append(b)
+            elif isinstance(b, dict) and b.get("type") == "text":
+                parti.append(b.get("text", ""))
+        return "\n".join(p for p in parti if p).strip()
+    return str(content).strip()
+
+
+def pulisci_markdown(testo: str) -> str:
+    """La casella di chat non renderizza il markdown: lo converte in testo semplice ordinato."""
+    t = testo
+    t = re.sub(r"```[a-zA-Z]*\n?", "", t)
+    t = t.replace("```", "")
+    t = re.sub(r"^\s{0,3}#{1,6}\s*", "", t, flags=re.MULTILINE)
+    t = re.sub(r"\*\*(.+?)\*\*", r"\1", t)
+    t = re.sub(r"__(.+?)__", r"\1", t)
+    t = re.sub(r"^\s*[\*\u2022]\s+", "- ", t, flags=re.MULTILINE)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
 
 
 def prepara_contenuto_multimodale(testo_utente: str, percorso_allegato: str):
@@ -512,6 +568,339 @@ class GestioneBackupDialog(ctk.CTkToplevel):
 
 
 # ==============================================================================
+# FINESTRA SELEZIONE ARTICOLI DAL MAGAZZINO (CREAZIONE DOCUMENTI)
+# ==============================================================================
+class SelezionaArticoliDialog(ctk.CTkToplevel):
+    """Cerca articoli nel magazzino, li aggiunge a un 'carrello' con quantita' (e prezzo opzionale)
+    e restituisce un blocco di testo da inviare all'agente AI."""
+    MAX_RISULTATI = 200
+
+    def __init__(self, parent, articoli: list, callback_inserisci):
+        super().__init__(parent)
+        self.title("Crea Documento da Magazzino • Selezione Articoli")
+        self.geometry("1000x780")
+        self.minsize(880, 660)
+        self.configure(fg_color=COL_BG_MAIN)
+        self.transient(parent)
+        self.after(150, self._attiva_modale)
+
+        self.callback_inserisci = callback_inserisci
+        self.carrello = {}
+        self.map_ris = {}
+        self._timer_ricerca = None
+
+        # Indice di ricerca precalcolato (veloce anche con molte righe)
+        self.indice = []
+        for a in articoli:
+            testo = f"{a.get('Codice', '')} {a.get('Descrizione', '')} " + " ".join(
+                str(v) for v in a.get("_extra", {}).values()
+            )
+            self.indice.append((a, testo.lower(), norm_ricerca(testo)))
+
+        ctk.CTkLabel(
+            self, text="🛒 Seleziona gli articoli del documento",
+            font=("Segoe UI", 16, "bold"), text_color="white"
+        ).pack(anchor="w", padx=20, pady=(16, 2))
+        ctk.CTkLabel(
+            self,
+            text="Cerca, seleziona uno o più articoli (doppio clic o ➕), indica le quantità. Poi inseriscili nella chat e scrivi all'AI cliente/fornitore e tipo di documento.",
+            font=("Segoe UI", 11), text_color=COL_TEXT_MUTED, wraplength=940, justify="left"
+        ).pack(anchor="w", padx=20, pady=(0, 8))
+
+        # --- Barra di ricerca ---
+        barra = ctk.CTkFrame(self, fg_color=COL_CARD, corner_radius=10, border_width=1, border_color=COL_BORDER)
+        barra.pack(fill="x", padx=20, pady=4)
+
+        ctk.CTkLabel(barra, text="🔍", font=("Segoe UI", 14)).pack(side="left", padx=(12, 6), pady=10)
+        self.cerca_entry = ctk.CTkEntry(
+            barra, placeholder_text="Cerca per codice, descrizione, reparto, ubicazione...",
+            fg_color=COL_BG_MAIN, border_color=COL_BORDER, height=34
+        )
+        self.cerca_entry.pack(side="left", fill="x", expand=True, padx=(0, 10), pady=10)
+        self.cerca_entry.bind("<KeyRelease>", lambda e: self._programma_ricerca())
+
+        ctk.CTkLabel(barra, text="Q.tà:", font=("Segoe UI", 12, "bold")).pack(side="left", padx=(0, 4))
+        self.qta_entry = ctk.CTkEntry(barra, width=60, height=34, fg_color=COL_BG_MAIN, border_color=COL_BORDER, justify="center")
+        self.qta_entry.insert(0, "1")
+        self.qta_entry.pack(side="left", padx=(0, 10))
+        self.qta_entry.bind("<Return>", lambda e: self.aggiungi_selezionati())
+
+        ctk.CTkButton(
+            barra, text="➕ Aggiungi", width=120, height=34,
+            fg_color=COL_BLUE, hover_color=COL_BLUE_HOVER, font=("Segoe UI", 12, "bold"),
+            command=self.aggiungi_selezionati
+        ).pack(side="left", padx=(0, 12), pady=10)
+
+        # --- Risultati ricerca ---
+        frame_ris = ctk.CTkFrame(self, fg_color=COL_BG_MAIN, corner_radius=10, border_width=1, border_color=COL_BORDER)
+        frame_ris.pack(fill="both", expand=True, padx=20, pady=(4, 2))
+
+        self.tree_ris = ttk.Treeview(
+            frame_ris, columns=("Codice", "Descrizione", "Giacenza", "Prezzo_Listino"),
+            show="headings", height=8, selectmode="extended"
+        )
+        for cid, titolo, w, anc in [
+            ("Codice", "CODICE", 130, "center"),
+            ("Descrizione", "DESCRIZIONE ARTICOLO", 520, "w"),
+            ("Giacenza", "GIACENZA", 100, "center"),
+            ("Prezzo_Listino", "LISTINO IVATO (€)", 140, "e"),
+        ]:
+            self.tree_ris.heading(cid, text=titolo)
+            self.tree_ris.column(cid, width=w, anchor=anc)
+        self.tree_ris.tag_configure("oddrow", background="#181C20")
+        self.tree_ris.tag_configure("evenrow", background="#1E2329")
+        self.tree_ris.tag_configure("lowstock", background="#3B181C", foreground="#FCA5A5")
+        self.tree_ris.bind("<Double-1>", lambda e: self.aggiungi_selezionati())
+        sb_ris = ttk.Scrollbar(frame_ris, orient="vertical", command=self.tree_ris.yview)
+        self.tree_ris.configure(yscroll=sb_ris.set)
+        sb_ris.pack(side="right", fill="y", pady=2, padx=2)
+        self.tree_ris.pack(side="left", fill="both", expand=True, padx=(2, 0), pady=2)
+
+        self.lbl_info_ris = ctk.CTkLabel(self, text="", font=("Segoe UI", 11, "italic"), text_color=COL_TEXT_MUTED)
+        self.lbl_info_ris.pack(anchor="w", padx=22, pady=(0, 4))
+
+        # --- Carrello documento ---
+        ctk.CTkLabel(
+            self, text="ARTICOLI DEL DOCUMENTO", font=("Segoe UI", 11, "bold"), text_color="#34D399"
+        ).pack(anchor="w", padx=22, pady=(2, 2))
+
+        frame_cart = ctk.CTkFrame(self, fg_color=COL_BG_MAIN, corner_radius=10, border_width=1, border_color=COL_BORDER)
+        frame_cart.pack(fill="both", expand=True, padx=20, pady=(0, 4))
+
+        self.tree_cart = ttk.Treeview(
+            frame_cart, columns=("Codice", "Descrizione", "Qta", "Prezzo"),
+            show="headings", height=6, selectmode="extended"
+        )
+        for cid, titolo, w, anc in [
+            ("Codice", "CODICE", 130, "center"),
+            ("Descrizione", "DESCRIZIONE ARTICOLO", 480, "w"),
+            ("Qta", "Q.TÀ", 80, "center"),
+            ("Prezzo", "PREZZO PERSONALIZZATO (€)", 200, "e"),
+        ]:
+            self.tree_cart.heading(cid, text=titolo)
+            self.tree_cart.column(cid, width=w, anchor=anc)
+        self.tree_cart.tag_configure("oddrow", background="#181C20")
+        self.tree_cart.tag_configure("evenrow", background="#1E2329")
+        self.tree_cart.bind("<<TreeviewSelect>>", self._su_selezione_carrello)
+        sb_cart = ttk.Scrollbar(frame_cart, orient="vertical", command=self.tree_cart.yview)
+        self.tree_cart.configure(yscroll=sb_cart.set)
+        sb_cart.pack(side="right", fill="y", pady=2, padx=2)
+        self.tree_cart.pack(side="left", fill="both", expand=True, padx=(2, 0), pady=2)
+
+        # --- Modifica riga selezionata ---
+        riga_mod = ctk.CTkFrame(self, fg_color=COL_CARD_LIGHT, corner_radius=10, border_width=1, border_color=COL_BORDER)
+        riga_mod.pack(fill="x", padx=20, pady=4)
+
+        ctk.CTkLabel(riga_mod, text="Riga selezionata →  Q.tà:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(12, 4), pady=8)
+        self.cart_qta_entry = ctk.CTkEntry(riga_mod, width=60, height=30, fg_color=COL_BG_MAIN, border_color=COL_BORDER, justify="center")
+        self.cart_qta_entry.pack(side="left", padx=(0, 10))
+
+        ctk.CTkLabel(riga_mod, text="Prezzo €:", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(0, 4))
+        self.cart_prezzo_entry = ctk.CTkEntry(
+            riga_mod, width=110, height=30, fg_color=COL_BG_MAIN, border_color=COL_BORDER,
+            placeholder_text="vuoto = listino", justify="center"
+        )
+        self.cart_prezzo_entry.pack(side="left", padx=(0, 10))
+
+        ctk.CTkButton(
+            riga_mod, text="✔ Applica alla riga", width=140, height=30, fg_color=COL_BLUE, hover_color=COL_BLUE_HOVER,
+            font=("Segoe UI", 11, "bold"), command=self.applica_riga
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            riga_mod, text="🗑 Rimuovi", width=100, height=30, fg_color="#374151", hover_color="#4B5563",
+            font=("Segoe UI", 11), command=self.rimuovi_righe
+        ).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(
+            riga_mod, text="Svuota tutto", width=100, height=30, fg_color="#374151", hover_color="#4B5563",
+            font=("Segoe UI", 11), command=self.svuota_carrello
+        ).pack(side="left")
+
+        # --- Footer ---
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.pack(fill="x", padx=20, pady=(6, 16))
+
+        self.lbl_riepilogo = ctk.CTkLabel(footer, text="0 articoli • 0 pezzi", font=("Segoe UI", 12, "bold"), text_color="#60A5FA")
+        self.lbl_riepilogo.pack(side="left", padx=(0, 20))
+
+        ctk.CTkLabel(footer, text="Prezzi personalizzati:", font=("Segoe UI", 11), text_color=COL_TEXT_MUTED).pack(side="left", padx=(0, 6))
+        self.seg_iva = ctk.CTkSegmentedButton(
+            footer, values=["IVA inclusa", "IVA esclusa"],
+            selected_color=COL_BLUE, selected_hover_color=COL_BLUE_HOVER, font=("Segoe UI", 11, "bold"), height=30
+        )
+        self.seg_iva.set("IVA inclusa")
+        self.seg_iva.pack(side="left")
+
+        ctk.CTkButton(
+            footer, text="📝 Inserisci nella Chat  ➤", width=220, height=40,
+            fg_color=COL_GREEN, hover_color=COL_GREEN_HOVER, font=("Segoe UI", 13, "bold"),
+            command=self.inserisci_nel_testo
+        ).pack(side="right")
+
+        self.aggiorna_risultati()
+        self.aggiorna_carrello()
+
+    # ---------------------------------------------------------------- utilità
+    def _attiva_modale(self):
+        try:
+            self.grab_set()
+            self.focus()
+            self.cerca_entry.focus()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _parse_qta(valore):
+        try:
+            q = int(float(str(valore).strip().replace(",", ".")))
+            return q if q > 0 else None
+        except (ValueError, TypeError):
+            return None
+
+    # ---------------------------------------------------------------- ricerca
+    def _programma_ricerca(self):
+        if self._timer_ricerca:
+            self.after_cancel(self._timer_ricerca)
+        self._timer_ricerca = self.after(150, self.aggiorna_risultati)
+
+    def aggiorna_risultati(self):
+        self._timer_ricerca = None
+        q = self.cerca_entry.get().strip().lower()
+        parole = q.split()
+        qn = norm_ricerca(q)
+
+        for r in self.tree_ris.get_children():
+            self.tree_ris.delete(r)
+        self.map_ris = {}
+
+        trovati = 0
+        mostrati = 0
+        for art, tl, tn in self.indice:
+            if parole and not (all(p in tl for p in parole) or (qn and qn in tn)):
+                continue
+            trovati += 1
+            if mostrati >= self.MAX_RISULTATI:
+                continue
+            giac = int(art.get("Giacenza") or 0)
+            listino = float(art.get("Prezzo_Listino") or 0.0)
+            tag = "lowstock" if giac <= 0 else ("evenrow" if mostrati % 2 == 0 else "oddrow")
+            iid = self.tree_ris.insert(
+                "", "end",
+                values=(art.get("Codice", ""), art.get("Descrizione", ""), giac, f"{listino:.2f}"),
+                tags=(tag,)
+            )
+            self.map_ris[iid] = art
+            mostrati += 1
+
+        if trovati > self.MAX_RISULTATI:
+            info = f"Trovati {trovati} articoli: mostrati i primi {self.MAX_RISULTATI}. Affina la ricerca."
+        else:
+            info = f"Trovati {trovati} articoli. (In rosso: giacenza esaurita o negativa)"
+        self.lbl_info_ris.configure(text=info)
+
+    # ---------------------------------------------------------------- carrello
+    def aggiungi_selezionati(self):
+        sel = self.tree_ris.selection()
+        if not sel:
+            messagebox.showinfo("Nessun articolo", "Seleziona almeno un articolo dall'elenco.", parent=self)
+            return
+        qta = self._parse_qta(self.qta_entry.get())
+        if qta is None:
+            messagebox.showwarning("Quantità non valida", "Inserisci una quantità intera maggiore di zero.", parent=self)
+            return
+        for iid in sel:
+            art = self.map_ris.get(iid)
+            if not art:
+                continue
+            cod = str(art["Codice"])
+            if cod in self.carrello:
+                self.carrello[cod]["qta"] += qta
+            else:
+                self.carrello[cod] = {
+                    "descrizione": art.get("Descrizione", ""),
+                    "qta": qta,
+                    "prezzo": None,
+                    "listino": float(art.get("Prezzo_Listino") or 0.0),
+                }
+        self.aggiorna_carrello()
+
+    def aggiorna_carrello(self):
+        for r in self.tree_cart.get_children():
+            self.tree_cart.delete(r)
+        tot_pezzi = 0
+        for idx, (cod, v) in enumerate(self.carrello.items()):
+            prezzo_txt = f"{v['prezzo']:.2f}" if v["prezzo"] is not None else f"listino ({v['listino']:.2f})"
+            self.tree_cart.insert(
+                "", "end", iid=cod,
+                values=(cod, v["descrizione"], v["qta"], prezzo_txt),
+                tags=("evenrow" if idx % 2 == 0 else "oddrow",)
+            )
+            tot_pezzi += v["qta"]
+        self.lbl_riepilogo.configure(text=f"{len(self.carrello)} articoli • {tot_pezzi} pezzi")
+
+    def _su_selezione_carrello(self, event=None):
+        sel = self.tree_cart.selection()
+        if len(sel) != 1:
+            return
+        v = self.carrello.get(sel[0])
+        if not v:
+            return
+        self.cart_qta_entry.delete(0, "end")
+        self.cart_qta_entry.insert(0, str(v["qta"]))
+        self.cart_prezzo_entry.delete(0, "end")
+        if v["prezzo"] is not None:
+            self.cart_prezzo_entry.insert(0, f"{v['prezzo']:.2f}")
+
+    def applica_riga(self):
+        sel = self.tree_cart.selection()
+        if len(sel) != 1:
+            messagebox.showinfo("Seleziona una riga", "Seleziona UNA riga del documento da modificare.", parent=self)
+            return
+        qta = self._parse_qta(self.cart_qta_entry.get())
+        if qta is None:
+            messagebox.showwarning("Quantità non valida", "Inserisci una quantità intera maggiore di zero.", parent=self)
+            return
+        prezzo_raw = self.cart_prezzo_entry.get().strip().replace(",", ".")
+        prezzo = None
+        if prezzo_raw:
+            try:
+                prezzo = float(prezzo_raw)
+                if prezzo < 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showwarning("Prezzo non valido", "Inserisci un prezzo numerico (es. 18,50) oppure lascia vuoto per usare il listino.", parent=self)
+                return
+        cod = sel[0]
+        self.carrello[cod]["qta"] = qta
+        self.carrello[cod]["prezzo"] = prezzo
+        self.aggiorna_carrello()
+
+    def rimuovi_righe(self):
+        for iid in self.tree_cart.selection():
+            self.carrello.pop(iid, None)
+        self.aggiorna_carrello()
+
+    def svuota_carrello(self):
+        self.carrello.clear()
+        self.aggiorna_carrello()
+
+    # ---------------------------------------------------------------- output
+    def inserisci_nel_testo(self):
+        if not self.carrello:
+            messagebox.showinfo("Documento vuoto", "Aggiungi almeno un articolo al documento.", parent=self)
+            return
+        suffisso_iva = "IVA inclusa" if self.seg_iva.get() == "IVA inclusa" else "IVA esclusa"
+        righe = []
+        for cod, v in self.carrello.items():
+            riga = f"- {v['qta']} x [{cod}] {v['descrizione']}"
+            if v["prezzo"] is not None:
+                riga += f" @ {v['prezzo']:.2f} EUR {suffisso_iva}"
+            righe.append(riga)
+        testo = "Articoli selezionati dal magazzino (usa i CODICI esatti):\n" + "\n".join(righe)
+        self.callback_inserisci(testo)
+        self.destroy()
+
+
+# ==============================================================================
 # INTERFACCIA GRAFICA PRINCIPALE
 # ==============================================================================
 class AppGestionale(ctk.CTk):
@@ -525,7 +914,8 @@ class AppGestionale(ctk.CTk):
         self.after(10, self.massimizza_finestra)
         self.protocol("WM_DELETE_WINDOW", self.alla_chiusura_app)
 
-        # Motore AI economico ed efficiente: Claude Haiku 5.5 con Prompt Caching attivo
+        # Motore AI economico ed efficiente: Claude Haiku 5.5 con Prompt Caching attivo.
+        # Se noti ancora errori di giudizio su casi ambigui, prova "claude-sonnet-5-5".
         self.agent_ai = None
         if API_KEY != "MANCANTE" and API_KEY:
             llm = ChatAnthropic(
@@ -816,6 +1206,17 @@ class AppGestionale(ctk.CTk):
 
         ctk.CTkButton(
             suggerimenti_frame,
+            text="🛒 Crea Documento da Magazzino",
+            font=("Segoe UI", 11, "bold"),
+            height=28,
+            fg_color=COL_GREEN,
+            hover_color=COL_GREEN_HOVER,
+            corner_radius=14,
+            command=self.apri_selezione_articoli
+        ).pack(side="left", padx=(10, 4))
+
+        ctk.CTkButton(
+            suggerimenti_frame,
             text="🧹 Nuova Chat",
             font=("Segoe UI", 11, "bold"),
             height=28,
@@ -871,17 +1272,19 @@ class AppGestionale(ctk.CTk):
         )
         self.bottone_allega.pack(side="left", padx=(0, 10))
 
-        self.input_testo = ctk.CTkEntry(
+        self.input_testo = ctk.CTkTextbox(
             self.frame_inferiore,
-            placeholder_text="Scrivi un comando oppure allega un PDF/foto di un documento fornitore...",
             font=("Segoe UI", 13),
             fg_color=COL_BG_MAIN,
             border_color=COL_BORDER,
+            border_width=2,
             corner_radius=10,
-            height=46
+            height=100,
+            wrap="word"
         )
         self.input_testo.pack(side="left", fill="x", expand=True, padx=(0, 10))
-        self.input_testo.bind("<Return>", lambda event: self.avvia_elaborazione())
+        # Invio = invia | Maiusc+Invio = vai a capo
+        self.input_testo.bind("<Return>", self._su_invio)
 
         self.bottone_invia = ctk.CTkButton(
             self.frame_inferiore,
@@ -902,7 +1305,7 @@ class AppGestionale(ctk.CTk):
         else:
             self.aggiungi_messaggio(
                 "Sistema",
-                "Benvenuto nel Gestionale AI. Puoi emettere documenti di vendita, caricare documenti fornitore oppure gestire magazzino e anagrafica in linguaggio naturale."
+                "Benvenuto nel Gestionale AI. Puoi emettere documenti di vendita, caricare documenti fornitore oppure gestire magazzino e anagrafica in linguaggio naturale.\n\nSuggerimento: Invio = invia, Maiusc+Invio = vai a capo. Con \"Crea Documento da Magazzino\" puoi scegliere gli articoli da una lista e inserirli qui."
             )
 
     def seleziona_file_fornitore(self):
@@ -919,18 +1322,62 @@ class AppGestionale(ctk.CTk):
             nome_file = os.path.basename(percorso)
             self.lbl_allegato.configure(text=f"📎 Documento pronto per l'analisi: {nome_file}")
             self.barra_allegato.pack(before=self.frame_inferiore, fill="x", padx=12, pady=(2, 4))
-            if not self.input_testo.get().strip():
-                self.input_testo.insert(0, "Analizza questo documento del fornitore e dimmi cosa contiene prima di registrarlo.")
-            self.input_testo.focus()
+            if not self._leggi_input():
+                self._scrivi_input("Analizza questo documento del fornitore e dimmi cosa contiene prima di registrarlo.")
+            self.input_testo._textbox.focus_set()
 
     def rimuovi_allegato(self):
         self.file_allegato_corrente = ""
         self.barra_allegato.pack_forget()
 
+    # --- Gestione casella di testo multi-riga ---
+    def _leggi_input(self) -> str:
+        return self.input_testo.get("1.0", "end").strip()
+
+    def _svuota_input(self):
+        self.input_testo.delete("1.0", "end")
+
+    def _scrivi_input(self, testo: str, aggiungi: bool = False):
+        if aggiungi and self._leggi_input():
+            esistente = self.input_testo.get("1.0", "end-1c")
+            sep = "" if esistente.endswith("\n") else "\n"
+            self.input_testo.insert("end", sep + testo)
+        else:
+            self._svuota_input()
+            self.input_testo.insert("1.0", testo)
+        tb = self.input_testo._textbox
+        tb.focus_set()
+        tb.mark_set("insert", "end-1c")
+        tb.see("end")
+
+    def _su_invio(self, event):
+        # Maiusc+Invio: lascia andare a capo; Invio: invia il comando
+        if event.state & 0x0001:
+            return None
+        self.avvia_elaborazione()
+        return "break"
+
     def inserisci_suggerimento(self, testo):
-        self.input_testo.delete(0, "end")
-        self.input_testo.insert(0, testo)
-        self.input_testo.focus()
+        if not self._leggi_input():
+            self._scrivi_input(testo)
+        else:
+            # Mantiene eventuali articoli già inseriti: la frase va in prima riga
+            self.input_testo.insert("1.0", testo + "\n")
+            tb = self.input_testo._textbox
+            tb.mark_set("insert", "1.end")
+            tb.focus_set()
+            tb.see("1.0")
+
+    def apri_selezione_articoli(self):
+        self.ricarica_magazzino_da_db()
+        if not self.cache_magazzino:
+            messagebox.showinfo("Magazzino vuoto", "Il magazzino è vuoto: importa prima il file Excel degli articoli.")
+            return
+        SelezionaArticoliDialog(self, self.cache_magazzino, callback_inserisci=self.inserisci_articoli_selezionati)
+
+    def inserisci_articoli_selezionati(self, testo: str):
+        self.tabview.set("  💬  Assistente AI  ")
+        self._scrivi_input(testo + "\n\n", aggiungi=True)
 
     def azzera_memoria_chat(self):
         self.storico_ram = [self.storico_ram[0]]
@@ -961,16 +1408,29 @@ class AppGestionale(ctk.CTk):
         self.chat_box.configure(state="disabled")
         self.chat_box.see("end")
 
+    def taglia_storico(self):
+        """Conserva il SystemMessage + gli ultimi messaggi, assicurandosi che la
+        conversazione inizi sempre con un messaggio dell'utente (richiesto dall'API)."""
+        sistema = self.storico_ram[0]
+        resto = self.storico_ram[1:]
+        if len(resto) > 6:
+            resto = resto[-6:]
+        while resto and not isinstance(resto[0], HumanMessage):
+            resto = resto[1:]
+        self.storico_ram = [sistema] + resto
+
     def avvia_elaborazione(self):
-        comando = self.input_testo.get().strip()
+        comando = self._leggi_input()
         allegato = self.file_allegato_corrente
 
         if not comando and not allegato:
             return
+        if str(self.bottone_invia.cget("state")) == "disabled":
+            return
         if not comando and allegato:
             comando = "Analizza questo documento del fornitore."
 
-        self.input_testo.delete(0, "end")
+        self._svuota_input()
         self.rimuovi_allegato()
 
         testo_visualizzato = f"[📎 Allegato: {os.path.basename(allegato)}]\n{comando}" if allegato else comando
@@ -981,19 +1441,23 @@ class AppGestionale(ctk.CTk):
 
         contenuto_msg = prepara_contenuto_multimodale(comando, allegato)
         self.storico_ram.append(HumanMessage(content=contenuto_msg))
-
-        # Conserva al massimo gli ultimi 6 messaggi oltre al SystemMessage
-        if len(self.storico_ram) > 7:
-            self.storico_ram = [self.storico_ram[0]] + self.storico_ram[-6:]
+        self.taglia_storico()
 
         threading.Thread(target=self.worker_thread, args=(allegato,), daemon=True).start()
 
     def worker_thread(self, allegato_inviato: str = ""):
+        errore = False
         try:
             risultato = self.agent_ai.invoke({"messages": self.storico_ram})
-            risposta = risultato["messages"][-1].content
+            risposta = estrai_testo(risultato["messages"][-1].content)
+            risposta = pulisci_markdown(risposta)
+            if not risposta:
+                risposta = "Operazione eseguita (nessun testo di risposta restituito)."
             self.storico_ram.append(AIMessage(content=risposta))
-
+        except Exception as e:
+            errore = True
+            risposta = f"Errore durante l'esecuzione: {str(e)}"
+        finally:
             # Rimuove i byte Base64 del PDF/immagine dalla RAM (il file fisico resta su disco!)
             if allegato_inviato:
                 for idx in range(len(self.storico_ram) - 1, 0, -1):
@@ -1002,8 +1466,10 @@ class AppGestionale(ctk.CTk):
                         testi = [b.get("text", "") for b in msg.content if isinstance(b, dict) and b.get("type") == "text"]
                         self.storico_ram[idx] = HumanMessage(content="\n".join(testi))
                         break
-        except Exception as e:
-            risposta = f"Errore durante l'esecuzione: {str(e)}"
+
+        # In caso di errore elimina l'ultimo messaggio utente, così la chat non resta in uno stato incoerente
+        if errore and len(self.storico_ram) > 1 and isinstance(self.storico_ram[-1], HumanMessage):
+            self.storico_ram.pop()
 
         self.after(0, self.mostra_risposta_ai, risposta)
 
@@ -1019,7 +1485,7 @@ class AppGestionale(ctk.CTk):
         self.aggiungi_messaggio("AI", risposta)
         self.bottone_invia.configure(state="normal")
         self.bottone_allega.configure(state="normal")
-        self.input_testo.focus()
+        self.input_testo._textbox.focus_set()
 
         self.ricarica_magazzino_da_db()
         self.ricarica_documenti_da_db()
